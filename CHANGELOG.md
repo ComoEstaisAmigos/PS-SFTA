@@ -3,6 +3,27 @@
 All notable changes to this fork are documented here. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## 2.0.1 - 2026-10-11
+
+### Changed
+- The legacy `UserChoice` hash is computed by the C# engine instead of upstream's PowerShell
+  code: it is the same MD5 and two mixing passes that `UserChoiceLatest` applies to its token
+  stream. The output is identical, checked against the original code and against the legacy
+  hashes Windows itself wrote.
+- Internal cleanup, no behaviour change: shared helpers for the association root and the
+  ProgId lookup behind `Get-FTA` / `Get-PTA`, one repeat-flush routine in the token encoder,
+  and the Explorer refresh (`SHChangeNotify`) moved into the existing native helper class.
+
+### Fixed
+- Removing a `UserChoice` key leaked a registry handle each time (the key was opened and never
+  closed before being deleted).
+- `Get-UserExperience` left `shell32.dll` open when reading it failed.
+
+- Loading the script into a PowerShell session that already holds a different version now
+  stops with a clear "open a new PowerShell window" message. Before, the C# part failed with
+  "type already exists" and the old version silently stayed in use (C# types cannot be
+  replaced in a running session).
+
 ## 2.0.0 - 2026-10-11
 
 Single-file continuation of upstream 1.2.0 that adds Windows 11 **UserChoiceLatest** support
