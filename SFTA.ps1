@@ -90,6 +90,10 @@ Set-StrictMode -Off
 # Where this file lives, so messages can print a command that works from any directory.
 $script:SftaScriptPath = $PSCommandPath
 
+# HKCU roots of the per-user choices for file extensions and URL protocols.
+$script:FileExtsRoot = 'Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts'
+$script:UrlAssocRoot = 'Software\Microsoft\Windows\Shell\Associations\UrlAssociations'
+
 # ---------------------------------------------------------------------------
 #  UserChoiceLatest hash engine (C#): a self-contained managed encoder plus a bridge to
 #  Windows' own encoder. The six lookup tables (decoded from cssxn's
@@ -118,6 +122,19 @@ mjmNtj4X2wd8ZjMXktM0TPDN69d/OeSsOvZYth0dOzLYbnuUpvt9vTSQ5umpdq8Nv/eTp+n03nR6TPM0
 vXq+P9lA5JEN5lsb3Ozskza4/HHahRtjXNc+7eNlxz+C9r297pv4SBs88dqwwf8Be/vZFVitAAA=
 '@ -replace '\s',''
 
+# Add-Type cannot replace a type in a running session: after another version of this file was
+# loaded, the C# below would fail with "type already exists" and the old engine would stay.
+$script:SftaVersion = '2.0.1'
+$loadedEngine = 'UserChoiceLatest' -as [type]
+if ($loadedEngine) {
+  $versionField = $loadedEngine.GetField('EngineVersion')
+  $loadedVersion = if ($versionField) { $versionField.GetValue($null) } else { $null }
+  if ($loadedVersion -ne $script:SftaVersion) {
+    $loadedName = if ($loadedVersion) { "SFTA.ps1 $loadedVersion is" } else { 'An older SFTA.ps1 is' }
+    throw "$loadedName already loaded in this PowerShell session, and its C# part cannot be replaced while the session runs. Open a new PowerShell window and load SFTA.ps1 $($script:SftaVersion) there."
+  }
+}
+
 Add-Type -TypeDefinition @'
 using System;
 using System.Collections.Generic;
@@ -131,6 +148,9 @@ using System.Text;
 // (MIT, Copyright (c) 2026 cssxn; see the license notice at the top of this file).
 public static class UserChoiceLatest
 {
+    // Must equal $script:SftaVersion; tells a later load which version owns these types.
+    public static readonly string EngineVersion = "2.0.1";
+
     // -- lookup tables (filled by LoadTables) --
     static byte[] ByteClass, TokenRegion, Fallback, BitWidth, ShortRewind, LongRewind;
     static bool _loaded;
@@ -228,11 +248,27 @@ public static class UserChoiceLatest
         return packed.ToArray();
     }
 
-    static string HashFromPacked(ushort[] packedArr)
+    // The legacy UserChoice hash is the same MD5 + two mixes, applied to the UTF-16 string plus
+    // its terminator instead of the token stream. Inputs too short to mix give "", as in the
+    // original PS-SFTA PowerShell implementation this replaces.
+    public static string LegacyHash(string baseInfo)
     {
-        var packed = new List<ushort>(packedArr);
-        byte[] bytes = new byte[packed.Count * 2];
-        for (int i = 0; i < packed.Count; i++)
+        ushort[] units = new ushort[baseInfo.Length + 1];
+        for (int i = 0; i < baseInfo.Length; i++) units[i] = baseInfo[i];
+        if (MixCount(units.Length * 2) < 2) return "";
+        return HashFromPacked(units);
+    }
+
+    static int MixCount(int byteLen)
+    {
+        int dwordLen = byteLen >> 2;
+        return ((byteLen & 4) == 0) ? dwordLen : dwordLen - 1;
+    }
+
+    static string HashFromPacked(ushort[] packed)
+    {
+        byte[] bytes = new byte[packed.Length * 2];
+        for (int i = 0; i < packed.Length; i++)
         {
             bytes[2 * i]     = (byte)packed[i];
             bytes[2 * i + 1] = (byte)(packed[i] >> 8);
@@ -245,13 +281,12 @@ public static class UserChoiceLatest
             for (int i = 0; i < 4; i++) md5[i] = BitConverter.ToUInt32(h, i * 4);
         }
 
-        int byteLen = bytes.Length, dwordLen = byteLen >> 2;
-        int mixCount = ((byteLen & 4) == 0) ? dwordLen : dwordLen - 1;
-        uint[] dw = new uint[(packed.Count + 1) / 2];
+        int mixCount = MixCount(bytes.Length);
+        uint[] dw = new uint[(packed.Length + 1) / 2];
         for (int i = 0; i < dw.Length; i++)
         {
             uint lo = packed[i * 2];
-            uint hi = (i * 2 + 1 < packed.Count) ? packed[i * 2 + 1] : 0U;
+            uint hi = (i * 2 + 1 < packed.Length) ? packed[i * 2 + 1] : 0U;
             dw[i] = lo | (hi << 16);
         }
 
@@ -377,34 +412,40 @@ public static class UserChoiceLatest
         return true;
     }
 
-    static void EmitFirst(State s, ref int cursor, int end, char[] inp, ulong token, byte kind)
+    // A run of repeated tokens just ended: emit it as a back-reference and rewind the cursor.
+    // False when the repeated token is outside the window (the caller then emits the token).
+    static bool TryFlushRepeat(State s, ref int cursor, ulong token, byte kind)
     {
-        if (token == s.Last && s.Repeat < 0xFF) { ++s.Repeat; return; }
         ulong distance;
-        if (s.Repeat != 0)
+        if (!FindPrevious(s, s.Last, out distance)) return false;
+        uint rep1 = s.Repeat - 1;
+        ulong entry;
+        if (distance >= 0x800)
         {
-            if (FindPrevious(s, s.Last, out distance))
-            {
-                uint rep1 = s.Repeat - 1;
-                ulong entry;
-                if (distance >= 0x800)
-                {
-                    ulong packed = (token >> 17) | ((ulong)rep1 << 48) | TOK_A;
-                    MarkSeen(s, packed); Push(s, packed);
-                    entry = s.Last;
-                }
-                else
-                {
-                    entry = (token >> 27) | ((ulong)((((uint)(ushort)distance - 1U) & 0x3FFU) | (rep1 << 11)) << 37) | TOK_B;
-                }
-                MarkSeen(s, entry); Push(s, entry);
-                s.Last = SENTINEL; s.Repeat = 0;
-                cursor -= (distance >= 0x800) ? LongRewind[kind] : ShortRewind[kind];
-                return;
-            }
+            ulong packed = (token >> 17) | ((ulong)rep1 << 48) | TOK_A;
+            MarkSeen(s, packed); Push(s, packed);
+            entry = s.Last;
         }
         else
         {
+            entry = (token >> 27) | ((ulong)((((uint)(ushort)distance - 1U) & 0x3FFU) | (rep1 << 11)) << 37) | TOK_B;
+        }
+        MarkSeen(s, entry); Push(s, entry);
+        s.Last = SENTINEL; s.Repeat = 0;
+        cursor -= (distance >= 0x800) ? LongRewind[kind] : ShortRewind[kind];
+        return true;
+    }
+
+    static void EmitFirst(State s, ref int cursor, int end, char[] inp, ulong token, byte kind)
+    {
+        if (token == s.Last && s.Repeat < 0xFF) { ++s.Repeat; return; }
+        if (s.Repeat != 0)
+        {
+            if (TryFlushRepeat(s, ref cursor, token, kind)) return;
+        }
+        else
+        {
+            ulong distance;
             if (FindPrevious(s, token, out distance) && cursor < end)
             {
                 byte nextKind = TokenRegion[ClassFromWord(inp[cursor]) + 256];
@@ -421,29 +462,7 @@ public static class UserChoiceLatest
     static void EmitSecond(State s, ref int cursor, ulong token, byte kind)
     {
         if (token == s.Last && s.Repeat < 0xFF) { ++s.Repeat; return; }
-        if (s.Repeat != 0)
-        {
-            ulong distance;
-            if (FindPrevious(s, s.Last, out distance))
-            {
-                uint rep1 = s.Repeat - 1;
-                ulong entry;
-                if (distance >= 0x800)
-                {
-                    ulong packed = (token >> 17) | ((ulong)rep1 << 48) | TOK_A;
-                    MarkSeen(s, packed); Push(s, packed);
-                    entry = s.Last;
-                }
-                else
-                {
-                    entry = (token >> 27) | ((ulong)((((uint)(ushort)distance - 1U) & 0x3FFU) | (rep1 << 11)) << 37) | TOK_B;
-                }
-                MarkSeen(s, entry); Push(s, entry);
-                s.Last = SENTINEL; s.Repeat = 0;
-                cursor -= (distance >= 0x800) ? LongRewind[kind] : ShortRewind[kind];
-                return;
-            }
-        }
+        if (s.Repeat != 0 && TryFlushRepeat(s, ref cursor, token, kind)) return;
         MarkSeen(s, token); Push(s, token); s.Last = token;
     }
 
@@ -509,8 +528,6 @@ public static class UserChoiceLatest
         FlushSecond(s);
     }
 
-    static uint Mul(uint a, uint b) { unchecked { return a * b; } }
-
     static void MixA(uint[] p, int count, uint[] md5, uint[] seed, uint[] outPair)
     {
         unchecked
@@ -523,13 +540,13 @@ public static class UserChoiceLatest
             {
                 acc += p[i];
                 uint x = acc, hi = x >> 16; i += 2;
-                uint t = Mul(x, mul) - Mul(hi, seed[3]);
-                uint ss = Mul(t, seed[1]) + Mul(t >> 16, 0x689B6B9FU);
-                uint part1 = Mul(ss, 0xEA970001U) - Mul(ss >> 16, 0x3C101569U);
+                uint t = x * mul - hi * seed[3];
+                uint ss = t * seed[1] + (t >> 16) * 0x689B6B9FU;
+                uint part1 = ss * 0xEA970001U - (ss >> 16) * 0x3C101569U;
                 uint w = p[i - 1] + part1;
-                uint t2 = Mul(w, md1) - Mul(w >> 16, seed[2]);
-                uint temp = Mul(t2, 0x59C3AF2DU) - Mul(t2 >> 16, 0x2232E0F1U);
-                acc = Mul(temp >> 16, 0x35BD1EC9U) + Mul(temp, 0x1EC90001U);
+                uint t2 = w * md1 - (w >> 16) * seed[2];
+                uint temp = t2 * 0x59C3AF2DU - (t2 >> 16) * 0x2232E0F1U;
+                acc = (temp >> 16) * 0x35BD1EC9U + temp * 0x1EC90001U;
                 sum += part1 + acc;
             }
             outPair[0] = acc; outPair[1] = sum;
@@ -546,22 +563,22 @@ public static class UserChoiceLatest
             while (loops-- != 0)
             {
                 uint x = p[idx] + acc; idx += 2;
-                uint t = Mul(x, md0);
-                uint a = Mul(t, 0xB1110000U) - Mul(t >> 16, 0x30674EEFU);
-                uint b = Mul(a, seed[2]);
-                uint c = b - Mul(a >> 16, 0x78F7A461U);
-                c = Mul(c >> 16, seed[0]) - Mul(a >> 16, 0x164D0000U) - Mul(b, 0x46930000U);
-                uint d = Mul(c >> 16, 0x257E1D83U) + Mul(c, 0x1D830000U);
+                uint t = x * md0;
+                uint a = t * 0xB1110000U - (t >> 16) * 0x30674EEFU;
+                uint b = a * seed[2];
+                uint c = b - (a >> 16) * 0x78F7A461U;
+                c = (c >> 16) * seed[0] - (a >> 16) * 0x164D0000U - b * 0x46930000U;
+                uint d = (c >> 16) * 0x257E1D83U + c * 0x1D830000U;
                 uint e = p[idx - 1] + d;
-                uint f = Mul(e, md1);
-                uint g = Mul(f, 0x16F50000U) - Mul(f >> 16, 0x5D8BE90BU);
-                uint h = Mul(g >> 16, seed[3]);
-                uint ii = Mul(g, 0x69010000U) + h;
-                uint j = Mul(ii, seed[1]);
-                uint k = ((0U - h) - Mul(g, 0x69010000U)) >> 16;
-                uint m = Mul(k, 0x7C932B89U) - j;
-                uint nn = Mul(k, 0xF2310000U) - Mul(m >> 16, 0x405B6097U);
-                nn += Mul(j, 0x60970000U);
+                uint f = e * md1;
+                uint g = f * 0x16F50000U - (f >> 16) * 0x5D8BE90BU;
+                uint h = (g >> 16) * seed[3];
+                uint ii = g * 0x69010000U + h;
+                uint j = ii * seed[1];
+                uint k = ((0U - h) - g * 0x69010000U) >> 16;
+                uint m = k * 0x7C932B89U - j;
+                uint nn = k * 0xF2310000U - (m >> 16) * 0x405B6097U;
+                nn += j * 0x60970000U;
                 acc = nn; sum += d + acc;
             }
             outPair[0] = acc; outPair[1] = sum;
@@ -693,7 +710,7 @@ public static class NativeUcl
 [NativeUcl]::Init()
 
 # ---------------------------------------------------------------------------
-#  Registry last-write time helper (native) + legacy UserChoice key deleter.
+#  Native helpers: registry last-write time, legacy UserChoice key deleter, shell refresh.
 # ---------------------------------------------------------------------------
 Add-Type -TypeDefinition @'
 using System;
@@ -709,8 +726,11 @@ public static class SftaNative
     static extern uint RegDeleteKeyW(UIntPtr hKey, string sub);
     [DllImport("advapi32.dll")]
     static extern int RegCloseKey(UIntPtr h);
+    [DllImport("shell32.dll")]
+    static extern void SHChangeNotify(int eventId, uint flags, IntPtr item1, IntPtr item2);
 
     const ulong HKCU = 0x80000001UL;
+    const int SHCNE_ASSOCCHANGED = 0x08000000;
 
     // Returns the key's FILETIME (100ns ticks), or -1 if the key is missing.
     public static long GetLastWriteTime(string subKeyHkcu)
@@ -728,9 +748,13 @@ public static class SftaNative
     // UCPD's registry filter does not block for the plain "UserChoice" leaf.
     public static void DeleteKey(string subKeyHkcu)
     {
-        UIntPtr h;
-        RegOpenKeyExW((UIntPtr)HKCU, subKeyHkcu, 0, 0x20019, out h);
         RegDeleteKeyW((UIntPtr)HKCU, subKeyHkcu);
+    }
+
+    // Tells Explorer to reload associations, so a change applies without restarting it.
+    public static void NotifyAssocChanged()
+    {
+        SHChangeNotify(SHCNE_ASSOCCHANGED, 0, IntPtr.Zero, IntPtr.Zero);
     }
 }
 '@
@@ -894,97 +918,15 @@ function Get-UclWritePlan {
 }
 
 # ---------------------------------------------------------------------------
-#  Legacy UserChoice hash (the original PS-SFTA algorithm, verbatim).
+#  Legacy UserChoice hash (the original PS-SFTA algorithm).
 # ---------------------------------------------------------------------------
 function Get-LegacyUserChoiceHash {
+  # Computed by the C# engine: the legacy hash is the same MD5 + two mixes that UserChoiceLatest
+  # applies to its token stream. The tests pin it to the original PowerShell code's output and to
+  # the hashes Windows itself wrote.
   [CmdletBinding()]
   param([Parameter(Mandatory)][string]$BaseInfo)
-
-  function local:Get-ShiftRight {
-    param([long]$iValue, [int]$iCount)
-    if ($iValue -band 0x80000000) { Write-Output (($iValue -shr $iCount) -bxor 0xFFFF0000) }
-    else { Write-Output ($iValue -shr $iCount) }
-  }
-  function local:Get-Long {
-    param([byte[]]$Bytes, [int]$Index = 0)
-    Write-Output ([BitConverter]::ToInt32($Bytes, $Index))
-  }
-  function local:Convert-Int32 {
-    param([long]$Value)
-    [byte[]]$bytes = [BitConverter]::GetBytes($Value)
-    return [BitConverter]::ToInt32($bytes, 0)
-  }
-
-  [Byte[]]$bytesBaseInfo = [System.Text.Encoding]::Unicode.GetBytes($BaseInfo)
-  $bytesBaseInfo += 0x00, 0x00
-  $MD5 = New-Object -TypeName System.Security.Cryptography.MD5CryptoServiceProvider
-  [Byte[]]$bytesMD5 = $MD5.ComputeHash($bytesBaseInfo)
-  $lengthBase = ($BaseInfo.Length * 2) + 2
-  $length = (($lengthBase -band 4) -le 1) + (Get-ShiftRight $lengthBase 2) - 1
-  $base64Hash = ""
-
-  if ($length -gt 1) {
-    $map = @{PDATA = 0; CACHE = 0; COUNTER = 0; INDEX = 0; MD51 = 0; MD52 = 0; OUTHASH1 = 0; OUTHASH2 = 0;
-      R0 = 0; R1 = @(0, 0); R2 = @(0, 0); R3 = 0; R4 = @(0, 0); R5 = @(0, 0); R6 = @(0, 0); R7 = @(0, 0) }
-    $map.CACHE = 0; $map.OUTHASH1 = 0; $map.PDATA = 0
-    $map.MD51 = (((Get-Long $bytesMD5) -bor 1) + 0x69FB0000L)
-    $map.MD52 = ((Get-Long $bytesMD5 4) -bor 1) + 0x13DB0000L
-    $map.INDEX = Get-ShiftRight ($length - 2) 1
-    $map.COUNTER = $map.INDEX + 1
-    while ($map.COUNTER) {
-      $map.R0 = Convert-Int32 ((Get-Long $bytesBaseInfo $map.PDATA) + [long]$map.OUTHASH1)
-      $map.R1[0] = Convert-Int32 (Get-Long $bytesBaseInfo ($map.PDATA + 4))
-      $map.PDATA = $map.PDATA + 8
-      $map.R2[0] = Convert-Int32 (($map.R0 * ([long]$map.MD51)) - (0x10FA9605L * ((Get-ShiftRight $map.R0 16))))
-      $map.R2[1] = Convert-Int32 ((0x79F8A395L * ([long]$map.R2[0])) + (0x689B6B9FL * (Get-ShiftRight $map.R2[0] 16)))
-      $map.R3 = Convert-Int32 ((0xEA970001L * $map.R2[1]) - (0x3C101569L * (Get-ShiftRight $map.R2[1] 16) ))
-      $map.R4[0] = Convert-Int32 ($map.R3 + $map.R1[0])
-      $map.R5[0] = Convert-Int32 ($map.CACHE + $map.R3)
-      $map.R6[0] = Convert-Int32 (($map.R4[0] * [long]$map.MD52) - (0x3CE8EC25L * (Get-ShiftRight $map.R4[0] 16)))
-      $map.R6[1] = Convert-Int32 ((0x59C3AF2DL * $map.R6[0]) - (0x2232E0F1L * (Get-ShiftRight $map.R6[0] 16)))
-      $map.OUTHASH1 = Convert-Int32 ((0x1EC90001L * $map.R6[1]) + (0x35BD1EC9L * (Get-ShiftRight $map.R6[1] 16)))
-      $map.OUTHASH2 = Convert-Int32 ([long]$map.R5[0] + [long]$map.OUTHASH1)
-      $map.CACHE = ([long]$map.OUTHASH2)
-      $map.COUNTER = $map.COUNTER - 1
-    }
-    [Byte[]]$outHash = @(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
-    [byte[]]$buffer = [BitConverter]::GetBytes($map.OUTHASH1); $buffer.CopyTo($outHash, 0)
-    $buffer = [BitConverter]::GetBytes($map.OUTHASH2); $buffer.CopyTo($outHash, 4)
-
-    $map = @{PDATA = 0; CACHE = 0; COUNTER = 0; INDEX = 0; MD51 = 0; MD52 = 0; OUTHASH1 = 0; OUTHASH2 = 0;
-      R0 = 0; R1 = @(0, 0); R2 = @(0, 0); R3 = 0; R4 = @(0, 0); R5 = @(0, 0); R6 = @(0, 0); R7 = @(0, 0) }
-    $map.CACHE = 0; $map.OUTHASH1 = 0; $map.PDATA = 0
-    $map.MD51 = ((Get-Long $bytesMD5) -bor 1)
-    $map.MD52 = ((Get-Long $bytesMD5 4) -bor 1)
-    $map.INDEX = Get-ShiftRight ($length - 2) 1
-    $map.COUNTER = $map.INDEX + 1
-    while ($map.COUNTER) {
-      $map.R0 = Convert-Int32 ((Get-Long $bytesBaseInfo $map.PDATA) + ([long]$map.OUTHASH1))
-      $map.PDATA = $map.PDATA + 8
-      $map.R1[0] = Convert-Int32 ($map.R0 * [long]$map.MD51)
-      $map.R1[1] = Convert-Int32 ((0xB1110000L * $map.R1[0]) - (0x30674EEFL * (Get-ShiftRight $map.R1[0] 16)))
-      $map.R2[0] = Convert-Int32 ((0x5B9F0000L * $map.R1[1]) - (0x78F7A461L * (Get-ShiftRight $map.R1[1] 16)))
-      $map.R2[1] = Convert-Int32 ((0x12CEB96DL * (Get-ShiftRight $map.R2[0] 16)) - (0x46930000L * $map.R2[0]))
-      $map.R3 = Convert-Int32 ((0x1D830000L * $map.R2[1]) + (0x257E1D83L * (Get-ShiftRight $map.R2[1] 16)))
-      $map.R4[0] = Convert-Int32 ([long]$map.MD52 * ([long]$map.R3 + (Get-Long $bytesBaseInfo ($map.PDATA - 4))))
-      $map.R4[1] = Convert-Int32 ((0x16F50000L * $map.R4[0]) - (0x5D8BE90BL * (Get-ShiftRight $map.R4[0] 16)))
-      $map.R5[0] = Convert-Int32 ((0x96FF0000L * $map.R4[1]) - (0x2C7C6901L * (Get-ShiftRight $map.R4[1] 16)))
-      $map.R5[1] = Convert-Int32 ((0x2B890000L * $map.R5[0]) + (0x7C932B89L * (Get-ShiftRight $map.R5[0] 16)))
-      $map.OUTHASH1 = Convert-Int32 ((0x9F690000L * $map.R5[1]) - (0x405B6097L * (Get-ShiftRight ($map.R5[1]) 16)))
-      $map.OUTHASH2 = Convert-Int32 ([long]$map.OUTHASH1 + $map.CACHE + $map.R3)
-      $map.CACHE = ([long]$map.OUTHASH2)
-      $map.COUNTER = $map.COUNTER - 1
-    }
-    $buffer = [BitConverter]::GetBytes($map.OUTHASH1); $buffer.CopyTo($outHash, 8)
-    $buffer = [BitConverter]::GetBytes($map.OUTHASH2); $buffer.CopyTo($outHash, 12)
-    [Byte[]]$outHashBase = @(0, 0, 0, 0, 0, 0, 0, 0)
-    $hashValue1 = ((Get-Long $outHash 8) -bxor (Get-Long $outHash))
-    $hashValue2 = ((Get-Long $outHash 12) -bxor (Get-Long $outHash 4))
-    $buffer = [BitConverter]::GetBytes($hashValue1); $buffer.CopyTo($outHashBase, 0)
-    $buffer = [BitConverter]::GetBytes($hashValue2); $buffer.CopyTo($outHashBase, 4)
-    $base64Hash = [Convert]::ToBase64String($outHashBase)
-  }
-  Write-Output $base64Hash
+  [UserChoiceLatest]::LegacyHash($BaseInfo)
 }
 
 # ---------------------------------------------------------------------------
@@ -1000,7 +942,8 @@ function Get-UcpdState {
   [pscustomobject]@{
     StartValue = if ($svc) { $svc.Start } else { $null }
     Running    = $running
-    # Active = the driver is currently loaded and will block protected writes.
+    # Active = the driver is currently loaded and will block protected writes. It equals Running
+    # today; both stay, as callers may read either.
     Active     = $running
   }
 }
@@ -1050,12 +993,8 @@ function Test-UclSelfCheck {
   [OutputType([string])]
   param([switch]$Quiet)
 
-  $roots = @(
-    'Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts',
-    'Software\Microsoft\Windows\Shell\Associations\UrlAssociations'
-  )
   $tested = 0
-  foreach ($root in $roots) {
+  foreach ($root in $script:FileExtsRoot, $script:UrlAssocRoot) {
     $base = "HKCU:\$root"
     if (-not (Test-Path $base)) { continue }
     foreach ($k in Get-ChildItem $base -ErrorAction SilentlyContinue) {
@@ -1110,13 +1049,7 @@ function Write-ApplicationAssociationToasts {
 }
 
 function Update-RegistryChanges {
-  $code = @'
-    [System.Runtime.InteropServices.DllImport("Shell32.dll")]
-    private static extern int SHChangeNotify(int eventId, int flags, IntPtr item1, IntPtr item2);
-    public static void Refresh() { SHChangeNotify(0x8000000, 0, IntPtr.Zero, IntPtr.Zero); }
-'@
-  try { Add-Type -MemberDefinition $code -Namespace SHChange -Name Notify -ErrorAction SilentlyContinue } catch { }
-  try { [SHChange.Notify]::Refresh() } catch { }
+  try { [SftaNative]::NotifyAssocChanged() } catch { }
 }
 
 function Test-AccessDeniedError {
@@ -1152,6 +1085,30 @@ To change it anyway, either:
 }
 
 function Get-SftaNow { [DateTime]::Now }
+
+function Get-SftaAssocRoot {
+  # FileExts for an extension (".pdf"), UrlAssociations for a protocol ("https").
+  param([Parameter(Mandatory)][string]$Extension)
+  if ($Extension.Contains('.')) { $script:FileExtsRoot } else { $script:UrlAssocRoot }
+}
+
+function Get-SftaChoiceProgId {
+  # UserChoiceLatest first (the key Explorer reads once the scheme is active), then UserChoice.
+  param([Parameter(Mandatory)][string]$KeyPath)
+  $latest = (Get-ItemProperty "$KeyPath\UserChoiceLatest\ProgId" -Name ProgId -ErrorAction SilentlyContinue).ProgId
+  if ($latest) { return $latest }
+  (Get-ItemProperty "$KeyPath\UserChoice" -ErrorAction SilentlyContinue).ProgId
+}
+
+function Get-SftaAssociation {
+  # The ProgId for one extension/protocol, or "name, ProgId" lines for all of them.
+  param([Parameter(Mandatory)][string]$Root, [string]$Name)
+  if ($Name) { return Get-SftaChoiceProgId -KeyPath "HKCU:\$Root\$Name" }
+  Get-ChildItem "HKCU:\$Root\*" | ForEach-Object {
+    $progId = Get-SftaChoiceProgId -KeyPath $_.PSPath
+    if ($progId) { "$($_.PSChildName), $progId" }
+  }
+}
 
 function Get-SftaProgIdForProgram {
   # The ProgId Register-FTA creates for a program: SFTA.<file name without spaces><.ext>
@@ -1195,9 +1152,9 @@ function Write-LegacyUserChoice {
   $fileTime = (Get-SftaNow).ToFileTime()
   for ($attempt = 1; $attempt -le 3; $attempt++) {
     $ts = Get-LegacyTimestampHex -FileTimeTicks $fileTime
-    # InvariantCulture, NOT .ToLower(): culture-aware casing differs on some locales and corrupts the hash.
-    # and corrupts the hash. The inputs (extension, SID, ProgId, hex time, shell32 string) are
-    # ASCII in practice, where invariant and ASCII-only lowercasing agree.
+    # InvariantCulture, NOT .ToLower(): culture-aware casing differs on some locales and corrupts
+    # the hash. The inputs (extension, SID, ProgId, hex time, shell32 string) are ASCII in
+    # practice, where invariant and ASCII-only lowercasing agree.
     $hash = Get-LegacyUserChoiceHash "$Extension$sid$ProgId$ts$userExperience".ToLowerInvariant()
     [SftaNative]::DeleteKey($keyPath)
     [Microsoft.Win32.Registry]::SetValue("HKEY_CURRENT_USER\$keyPath", "Hash", $hash)
@@ -1259,35 +1216,13 @@ function Write-UserChoiceLatest {
 function Get-FTA {
   [CmdletBinding()]
   param([Parameter(Mandatory = $false)][String]$Extension)
-  if ($Extension) {
-    $latest = (Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\$Extension\UserChoiceLatest\ProgId" -Name ProgId -ErrorAction SilentlyContinue).ProgId
-    if ($latest) { Write-Output $latest; return }
-    Write-Output (Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\$Extension\UserChoice" -ErrorAction SilentlyContinue).ProgId
-  }
-  else {
-    Get-ChildItem HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\* | ForEach-Object {
-      $progId = (Get-ItemProperty "$($_.PSPath)\UserChoiceLatest\ProgId" -Name ProgId -ErrorAction SilentlyContinue).ProgId
-      if (-not $progId) { $progId = (Get-ItemProperty "$($_.PSPath)\UserChoice" -ErrorAction SilentlyContinue).ProgId }
-      if ($progId) { "$($_.PSChildName), $progId" }
-    }
-  }
+  Get-SftaAssociation -Root $script:FileExtsRoot -Name $Extension
 }
 
 function Get-PTA {
   [CmdletBinding()]
   param([Parameter(Mandatory = $false)][String]$Protocol)
-  if ($Protocol) {
-    $latest = (Get-ItemProperty "HKCU:\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\$Protocol\UserChoiceLatest\ProgId" -Name ProgId -ErrorAction SilentlyContinue).ProgId
-    if ($latest) { Write-Output $latest; return }
-    Write-Output (Get-ItemProperty "HKCU:\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\$Protocol\UserChoice" -ErrorAction SilentlyContinue).ProgId
-  }
-  else {
-    Get-ChildItem HKCU:\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\* | ForEach-Object {
-      $progId = (Get-ItemProperty "$($_.PSPath)\UserChoiceLatest\ProgId" -Name ProgId -ErrorAction SilentlyContinue).ProgId
-      if (-not $progId) { $progId = (Get-ItemProperty "$($_.PSPath)\UserChoice" -ErrorAction SilentlyContinue).ProgId }
-      if ($progId) { "$($_.PSChildName), $progId" }
-    }
-  }
+  Get-SftaAssociation -Root $script:UrlAssocRoot -Name $Protocol
 }
 
 function Set-FTA {
@@ -1301,10 +1236,7 @@ function Set-FTA {
   )
 
   $ProgId = Resolve-SftaProgId -ProgIdOrPath $ProgId -Extension $Extension
-
-  $isExt = $Extension.Contains(".")
-  $root = if ($isExt) { 'Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts' }
-  else { 'Software\Microsoft\Windows\Shell\Associations\UrlAssociations' }
+  $root = Get-SftaAssocRoot -Extension $Extension
 
   $uclPlan = Get-UclWritePlan
   if ($uclPlan.Action -eq 'refuse') {
@@ -1402,10 +1334,7 @@ function Remove-FTA {
     [Parameter(Mandatory = $true)][String]$Extension
   )
   $ProgId = Resolve-SftaProgId -ProgIdOrPath $ProgramPath -Extension $Extension
-
-  $isExt = $Extension.Contains(".")
-  $root = if ($isExt) { 'Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts' }
-  else { 'Software\Microsoft\Windows\Shell\Associations\UrlAssociations' }
+  $root = Get-SftaAssocRoot -Extension $Extension
 
   foreach ($leaf in 'UserChoice', 'UserChoiceLatest\ProgId', 'UserChoiceLatest') {
     [SftaNative]::DeleteKey("$root\$Extension\$leaf")
@@ -1432,9 +1361,8 @@ function Get-UserExperience {
   try {
     $p = [Environment]::GetFolderPath([Environment+SpecialFolder]::SystemX86) + "\Shell32.dll"
     $fs = [System.IO.File]::Open($p, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
-    $br = New-Object System.IO.BinaryReader($fs)
-    [Byte[]]$data = $br.ReadBytes(5mb)
-    $fs.Close()
+    try { [Byte[]]$data = (New-Object System.IO.BinaryReader($fs)).ReadBytes(5mb) }
+    finally { $fs.Dispose() }
     $s = [Text.Encoding]::Unicode.GetString($data)
     $p1 = $s.IndexOf($search)
     $p2 = $s.IndexOf("}", $p1)

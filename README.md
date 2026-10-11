@@ -76,7 +76,7 @@ Loading the script straight from GitHub, checked against the SHA256 of this rele
 instead of running anything if the check fails, so update the hash together with `SFTA.ps1`):
 
 ```bat
-powershell -ExecutionPolicy Bypass -Command "& { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; $f = Join-Path $env:TEMP 'SFTA.ps1'; (New-Object Net.WebClient).DownloadFile('https://raw.githubusercontent.com/ComoEstaisAmigos/PS-SFTA/master/SFTA.ps1', $f); $h = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash([IO.File]::ReadAllBytes($f))).Replace('-', ''); if ($h -ne '18597A79D233438ACB6FE7A1F22965A5274FEBA77D4D921B2151CC6CD0A1487B') { throw 'SFTA.ps1 hash mismatch' }; . $f; Set-FTA 'Applications\SumatraPDF.exe' '.pdf' }"
+powershell -ExecutionPolicy Bypass -Command "& { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; $f = Join-Path $env:TEMP 'SFTA.ps1'; (New-Object Net.WebClient).DownloadFile('https://raw.githubusercontent.com/ComoEstaisAmigos/PS-SFTA/master/SFTA.ps1', $f); $h = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash([IO.File]::ReadAllBytes($f))).Replace('-', ''); if ($h -ne '76251738E4F41A52F0B40C16F88042E07C8B1942D15171C5C7173170A0838264') { throw 'SFTA.ps1 hash mismatch' }; . $f; Set-FTA 'Applications\SumatraPDF.exe' '.pdf' }"
 ```
 
 Running the file directly forwards two or three arguments to `Set-FTA`
